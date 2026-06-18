@@ -82,8 +82,9 @@ def check_notice_for_livestream(notice_url):
                 any(k in href.lower() for k in KNOWN_STREAMERS.keys())
             )
 
-            if is_stream and href.startswith("http"):
-                livestream_links.append(href)
+        if is_stream and href.startswith("http"):
+        if "youtube.com/@Rip.ieEndofLifeMatters" not in href:
+        livestream_links.append(href)
 
         # Also scan raw page text for livestream mentions
         page_text = soup.get_text().lower()
