@@ -1,20 +1,19 @@
 import imaplib
 import smtplib
 import email
+import os
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from bs4 import BeautifulSoup
 import requests
-import re
 from datetime import datetime
 
 # ============================================================
-# CONFIGURATION — fill in your details here
+# CONFIGURATION — reads from GitHub Secrets (environment variables)
 # ============================================================
-import os
-GMAIL_ADDRESS   = os.environ.get("GMAIL_ADDRESS", "")
-APP_PASSWORD    = os.environ.get("APP_PASSWORD", "")
-NOTIFY_EMAIL    = os.environ.get("NOTIFY_EMAIL", "")
+GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "")
+APP_PASSWORD  = os.environ.get("APP_PASSWORD", "")
+NOTIFY_EMAIL  = os.environ.get("NOTIFY_EMAIL", "")
 # ============================================================
 
 HEADERS = {
@@ -25,16 +24,22 @@ HEADERS = {
 }
 
 KNOWN_STREAMERS = {
-    "eventlive":        "EventLive",
-    "churchservices":   "Church Services TV",
-    "youtube":          "YouTube",
-    "facebook":         "Facebook Live",
-    "mcnmedia":         "MCN Media",
-    "funeralvideo":     "Funeral Video IE",
-    "vimeo":            "Vimeo",
-    "obitus":           "Obitus",
-    "tributestream":    "Tribute Stream",
+    "eventlive":      "EventLive",
+    "churchservices": "Church Services TV",
+    "youtube":        "YouTube",
+    "facebook":       "Facebook Live",
+    "mcnmedia":       "MCN Media",
+    "funeralvideo":   "Funeral Video IE",
+    "vimeo":          "Vimeo",
+    "obitus":         "Obitus",
+    "tributestream":  "Tribute Stream",
 }
+
+# Links containing these strings will be ignored
+IGNORE_URLS = [
+    "youtube.com/@Rip.ieEndofLifeMatters",
+    "youtube.com/rip.ie",
+]
 
 
 def identify_streamer(url):
@@ -43,7 +48,6 @@ def identify_streamer(url):
     for keyword, name in KNOWN_STREAMERS.items():
         if keyword in url_lower:
             return name
-    # Try fetching the page title as a fallback
     try:
         r = requests.get(url, headers=HEADERS, timeout=10)
         soup = BeautifulSoup(r.text, "html.parser")
@@ -55,17 +59,23 @@ def identify_streamer(url):
     return "Unknown streamer"
 
 
+def is_ignored_url(url):
+    """Return True if this URL should be filtered out."""
+    for pattern in IGNORE_URLS:
+        if pattern in url:
+            return True
+    return False
+
+
 def check_notice_for_livestream(notice_url):
     """Visit a rip.ie death notice page and look for a livestream link."""
     try:
         r = requests.get(notice_url, headers=HEADERS, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
 
-        # Find all links in the page
         links = soup.find_all("a", href=True)
-
-        # Look for livestream mentions in surrounding text or link text
         livestream_links = []
+
         for link in links:
             href = link["href"]
             text = link.get_text(strip=True).lower()
@@ -74,25 +84,24 @@ def check_notice_for_livestream(notice_url):
                 context = link.parent.get_text(strip=True).lower()
 
             is_stream = (
-                "livestream" in text or
-                "live stream" in text or
-                "live" in text and "stream" in context or
-                "click here" in text and "stream" in context or
-                "watch" in text and "live" in context or
-                any(k in href.lower() for k in KNOWN_STREAMERS.keys())
+                "livestream" in text
+                or "live stream" in text
+                or ("live" in text and "stream" in context)
+                or ("click here" in text and "stream" in context)
+                or ("watch" in text and "live" in context)
+                or any(k in href.lower() for k in KNOWN_STREAMERS.keys())
             )
 
-                if is_stream and href.startswith("http"):
-                    if "youtube.com/@Rip.ieEndofLifeMatters" not in href:
-                        livestream_links.append(href)
+            if is_stream and href.startswith("http"):
+                if not is_ignored_url(href):
+                    livestream_links.append(href)
 
-        # Also scan raw page text for livestream mentions
         page_text = soup.get_text().lower()
         has_mention = "livestream" in page_text or "live stream" in page_text
 
         return livestream_links, has_mention
 
-    except Exception as e:
+    except Exception:
         return [], False
 
 
@@ -111,7 +120,6 @@ def get_rip_links_from_email(msg):
 
     soup = BeautifulSoup(body, "html.parser")
 
-    # Find all links pointing to rip.ie death notices
     for a in soup.find_all("a", href=True):
         href = a["href"]
         if "rip.ie/death-notice/" in href and "/s/" not in href:
@@ -128,7 +136,6 @@ def fetch_rip_emails():
     mail.login(GMAIL_ADDRESS, APP_PASSWORD)
     mail.select("inbox")
 
-    # Search for unread emails from rip.ie
     status, messages = mail.search(None, '(UNSEEN FROM "rip.ie")')
     email_ids = messages[0].split()
 
@@ -138,7 +145,6 @@ def fetch_rip_emails():
         raw = data[0][1]
         msg = email.message_from_bytes(raw)
         fetched.append(msg)
-        # Mark as read
         mail.store(eid, "+FLAGS", "\\Seen")
 
     mail.logout()
@@ -151,7 +157,7 @@ def send_summary_email(findings):
 
     if not findings:
         subject = f"RIP.ie Monitor — {today} — No livestreams found"
-        body = f"<h2>RIP.ie Monitor — {today}</h2><p>No new notices with livestreams found today.</p>"
+        body = f"<h2>RIP.ie Monitor — {today}</h2><p>No new notices with livestreams found.</p>"
     else:
         subject = f"RIP.ie Monitor — {today} — {len(findings)} livestream(s) found"
         rows = ""
@@ -185,7 +191,7 @@ def send_summary_email(findings):
             {rows}
         </table>
         <p style="color:#999;font-size:12px;margin-top:20px;">
-            Sent automatically by your RIP Monitor script
+            Sent automatically by your RIP Monitor
         </p>"""
 
     msg = MIMEMultipart("alternative")
