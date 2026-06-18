@@ -11,9 +11,10 @@ from datetime import datetime
 # ============================================================
 # CONFIGURATION — fill in your details here
 # ============================================================
-GMAIL_ADDRESS   = "your.email@gmail.com"       # Your Gmail address
-APP_PASSWORD    = "abcd efgh ijkl mnop"         # Your 16-character App Password
-NOTIFY_EMAIL    = "your.email@gmail.com"        # Where to send the summary (can be same)
+import os
+GMAIL_ADDRESS   = os.environ.get("GMAIL_ADDRESS", "")
+APP_PASSWORD    = os.environ.get("APP_PASSWORD", "")
+NOTIFY_EMAIL    = os.environ.get("NOTIFY_EMAIL", "")
 # ============================================================
 
 HEADERS = {
