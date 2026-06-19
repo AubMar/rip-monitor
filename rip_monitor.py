@@ -2,6 +2,7 @@ import imaplib
 import smtplib
 import email
 import os
+import sqlite3
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from bs4 import BeautifulSoup
@@ -15,6 +16,8 @@ GMAIL_ADDRESS = os.environ.get("GMAIL_ADDRESS", "")
 APP_PASSWORD  = os.environ.get("APP_PASSWORD", "")
 NOTIFY_EMAIL  = os.environ.get("NOTIFY_EMAIL", "")
 # ============================================================
+
+DB_PATH = "processed_notices.db"
 
 HEADERS = {
     "User-Agent": (
@@ -35,15 +38,53 @@ KNOWN_STREAMERS = {
     "tributestream":  "Tribute Stream",
 }
 
-# Links containing these strings will be ignored
 IGNORE_URLS = [
     "youtube.com/@Rip.ieEndofLifeMatters",
     "youtube.com/rip.ie",
 ]
 
 
+# ------------------------------------------------------------
+# DATABASE
+# ------------------------------------------------------------
+def init_db():
+    """Create the database table if it doesn't already exist."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS processed_notices (
+            notice_url   TEXT PRIMARY KEY,
+            name         TEXT,
+            date_found   TEXT,
+            had_stream   INTEGER
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+def already_processed(conn, notice_url):
+    """Return True if this notice_url already exists in the database."""
+    cursor = conn.execute(
+        "SELECT 1 FROM processed_notices WHERE notice_url = ?",
+        (notice_url,)
+    )
+    return cursor.fetchone() is not None
+
+
+def mark_processed(conn, notice_url, name, had_stream):
+    """Insert a record so this notice is never reprocessed."""
+    conn.execute(
+        "INSERT OR IGNORE INTO processed_notices (notice_url, name, date_found, had_stream) "
+        "VALUES (?, ?, ?, ?)",
+        (notice_url, name, datetime.now().strftime("%Y-%m-%d %H:%M"), int(had_stream))
+    )
+    conn.commit()
+
+
+# ------------------------------------------------------------
+# STREAM DETECTION
+# ------------------------------------------------------------
 def identify_streamer(url):
-    """Look at a livestream URL and identify the platform/operator."""
     url_lower = url.lower()
     for keyword, name in KNOWN_STREAMERS.items():
         if keyword in url_lower:
@@ -60,15 +101,10 @@ def identify_streamer(url):
 
 
 def is_ignored_url(url):
-    """Return True if this URL should be filtered out."""
-    for pattern in IGNORE_URLS:
-        if pattern in url:
-            return True
-    return False
+    return any(pattern in url for pattern in IGNORE_URLS)
 
 
 def check_notice_for_livestream(notice_url):
-    """Visit a rip.ie death notice page and look for a livestream link."""
     try:
         r = requests.get(notice_url, headers=HEADERS, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
@@ -105,8 +141,10 @@ def check_notice_for_livestream(notice_url):
         return [], False
 
 
+# ------------------------------------------------------------
+# EMAIL READING (Gmail is NEVER marked as read — purely informational)
+# ------------------------------------------------------------
 def get_rip_links_from_email(msg):
-    """Extract name and rip.ie notice URL from a RIP.ie alert email."""
     results = []
     body = ""
 
@@ -131,13 +169,21 @@ def get_rip_links_from_email(msg):
 
 
 def fetch_rip_emails():
-    """Log into Gmail via IMAP and fetch unread RIP.ie alert emails."""
+    """
+    Reads ALL rip.ie emails (read or unread) from recent history.
+    Does NOT mark anything as read - Gmail's read/unread flag is left
+    entirely under Aubrey's manual control.
+    Deduplication is handled separately via the SQLite database.
+    """
     mail = imaplib.IMAP4_SSL("imap.gmail.com")
     mail.login(GMAIL_ADDRESS, APP_PASSWORD)
-    mail.select("inbox")
+    mail.select("inbox", readonly=True)  # readonly=True guarantees nothing gets altered
 
-    status, messages = mail.search(None, '(UNSEEN FROM "rip.ie")')
+    status, messages = mail.search(None, '(FROM "rip.ie")')
     email_ids = messages[0].split()
+
+    # Limit to the most recent 150 to keep things fast
+    email_ids = email_ids[-150:]
 
     fetched = []
     for eid in email_ids:
@@ -145,28 +191,30 @@ def fetch_rip_emails():
         raw = data[0][1]
         msg = email.message_from_bytes(raw)
         fetched.append(msg)
-        mail.store(eid, "+FLAGS", "\\Seen")
+        # No mail.store() call - nothing is ever marked as read
 
     mail.logout()
     return fetched
 
 
+# ------------------------------------------------------------
+# SUMMARY EMAIL
+# ------------------------------------------------------------
 def send_summary_email(findings):
-    """Send a formatted summary email with the results."""
     today = datetime.now().strftime("%d %B %Y")
 
     if not findings:
-        subject = f"RIP.ie Monitor — {today} — No livestreams found"
+        subject = f"RIP.ie Monitor — {today} — No new livestreams found"
         body = f"<h2>RIP.ie Monitor — {today}</h2><p>No new notices with livestreams found.</p>"
     else:
-        subject = f"RIP.ie Monitor — {today} — {len(findings)} livestream(s) found"
+        subject = f"RIP.ie Monitor — {today} — {len(findings)} new livestream(s) found"
         rows = ""
         for f in findings:
             stream_info = ""
             if f["streams"]:
                 for url in f["streams"]:
                     streamer = identify_streamer(url)
-                    stream_info += f'<br>🎥 <b>{streamer}</b>: <a href="{url}">{url}</a>'
+                    stream_info += f'<br>streamer: <b>{streamer}</b>: <a href="{url}">{url}</a>'
             else:
                 stream_info = "<i>Livestream mentioned but no direct link found</i>"
 
@@ -182,7 +230,7 @@ def send_summary_email(findings):
 
         body = f"""
         <h2 style="color:#8B6914;">RIP.ie Monitor — {today}</h2>
-        <p>{len(findings)} notice(s) with livestream found in your area:</p>
+        <p>{len(findings)} new notice(s) with livestream found:</p>
         <table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;">
             <tr style="background:#c8a951;color:white;">
                 <th style="padding:8px;text-align:left;">Name</th>
@@ -191,7 +239,7 @@ def send_summary_email(findings):
             {rows}
         </table>
         <p style="color:#999;font-size:12px;margin-top:20px;">
-            Sent automatically by your RIP Monitor
+            Sent automatically by your RIP Monitor — each notice is reported once only
         </p>"""
 
     msg = MIMEMultipart("alternative")
@@ -207,34 +255,57 @@ def send_summary_email(findings):
     print(f"Summary email sent: {subject}")
 
 
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
 def main():
     print(f"RIP Monitor starting — {datetime.now().strftime('%Y-%m-%d %H:%M')}")
 
+    conn = init_db()
+
     emails = fetch_rip_emails()
-    print(f"Found {len(emails)} new RIP.ie alert email(s)")
+    print(f"Found {len(emails)} RIP.ie email(s) in inbox (read or unread)")
 
     all_notices = []
     for msg in emails:
         notices = get_rip_links_from_email(msg)
         all_notices.extend(notices)
 
-    print(f"Found {len(all_notices)} death notice link(s) to check")
+    # De-duplicate notices that appear in multiple emails this run
+    seen_this_run = set()
+    unique_notices = []
+    for n in all_notices:
+        if n["url"] not in seen_this_run:
+            seen_this_run.add(n["url"])
+            unique_notices.append(n)
+
+    print(f"Found {len(unique_notices)} unique death notice link(s)")
+
+    # Filter out ones already in the database
+    new_notices = [n for n in unique_notices if not already_processed(conn, n["url"])]
+    print(f"{len(new_notices)} of those are new (not yet in database)")
 
     findings = []
-    for notice in all_notices:
+    for notice in new_notices:
         print(f"  Checking: {notice['name']} — {notice['url']}")
         streams, has_mention = check_notice_for_livestream(notice["url"])
-        if streams or has_mention:
+        had_stream = bool(streams or has_mention)
+
+        if had_stream:
             findings.append({
                 "name":       notice["name"],
                 "notice_url": notice["url"],
                 "streams":    streams,
             })
-            print(f"    → Livestream found! {streams}")
+            print(f"    -> Livestream found! {streams}")
         else:
-            print(f"    → No livestream")
+            print(f"    -> No livestream")
+
+        # Record in the database either way, so it's never checked again
+        mark_processed(conn, notice["url"], notice["name"], had_stream)
 
     send_summary_email(findings)
+    conn.close()
     print("Done.")
 
 
