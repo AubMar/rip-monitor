@@ -30,6 +30,7 @@ HEADERS = {
 KNOWN_STREAMERS = {
     "eventlive":      "EventLive",
     "churchservices": "Church Services TV",
+    "navanparish":    "Navan Parish",
     "youtube":        "YouTube",
     "facebook":       "Facebook Live",
     "mcnmedia":       "MCN Media",
