@@ -58,6 +58,10 @@ DATE_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+FUNERAL_HOME_PATTERN = re.compile(
+    r"([A-Z][A-Za-z'&]+(?:\s+[A-Z][A-Za-z'&]+){0,4}\s+Funeral\s+(?:Home|Homes|Directors))",
+)
+
 
 # ------------------------------------------------------------
 # DATABASE
@@ -82,6 +86,8 @@ def init_db():
         conn.execute("ALTER TABLE processed_notices ADD COLUMN notice_date TEXT")
     if "streamer" not in existing_cols:
         conn.execute("ALTER TABLE processed_notices ADD COLUMN streamer TEXT")
+    if "funeral_home" not in existing_cols:
+        conn.execute("ALTER TABLE processed_notices ADD COLUMN funeral_home TEXT")
     conn.commit()
 
     return conn
@@ -95,11 +101,11 @@ def already_processed(conn, notice_url):
     return cursor.fetchone() is not None
 
 
-def mark_processed(conn, notice_url, name, had_stream, notice_date, streamer):
+def mark_processed(conn, notice_url, name, had_stream, notice_date, streamer, funeral_home):
     conn.execute(
         "INSERT OR IGNORE INTO processed_notices "
-        "(notice_url, name, date_found, had_stream, notice_date, streamer) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "(notice_url, name, date_found, had_stream, notice_date, streamer, funeral_home) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         (
             notice_url,
             name,
@@ -107,6 +113,7 @@ def mark_processed(conn, notice_url, name, had_stream, notice_date, streamer):
             int(had_stream),
             notice_date,
             streamer,
+            funeral_home,
         )
     )
     conn.commit()
@@ -144,16 +151,26 @@ def extract_notice_date(soup):
     return None
 
 
+def extract_funeral_home(soup):
+    """Try to find the funeral home / directors name printed on the page."""
+    page_text = soup.get_text(" ", strip=True)
+    match = FUNERAL_HOME_PATTERN.search(page_text)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
 def check_notice_for_livestream(notice_url):
     """
     Visits a rip.ie death notice page.
-    Returns: (livestream_links, has_mention, notice_date)
+    Returns: (livestream_links, has_mention, notice_date, funeral_home)
     """
     try:
         r = requests.get(notice_url, headers=HEADERS, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
 
         notice_date = extract_notice_date(soup)
+        funeral_home = extract_funeral_home(soup)
 
         links = soup.find_all("a", href=True)
         livestream_links = []
@@ -187,10 +204,10 @@ def check_notice_for_livestream(notice_url):
             or "viewed live" in page_text
         )
 
-        return livestream_links, has_mention, notice_date
+        return livestream_links, has_mention, notice_date, funeral_home
 
     except Exception:
-        return [], False, None
+        return [], False, None, None
 
 
 # ------------------------------------------------------------
@@ -269,6 +286,7 @@ def send_summary_email(findings):
                 stream_info = "<i>Livestream mentioned but no direct link found</i>"
 
             notice_date_display = f.get("notice_date") or "unknown date"
+            funeral_home_display = f.get("funeral_home") or "—"
 
             rows += f"""
             <tr>
@@ -277,6 +295,9 @@ def send_summary_email(findings):
                 </td>
                 <td style="padding:8px;border-bottom:1px solid #eee;">
                     {notice_date_display}
+                </td>
+                <td style="padding:8px;border-bottom:1px solid #eee;">
+                    {funeral_home_display}
                 </td>
                 <td style="padding:8px;border-bottom:1px solid #eee;">
                     {stream_info}
@@ -290,6 +311,7 @@ def send_summary_email(findings):
             <tr style="background:#c8a951;color:white;">
                 <th style="padding:8px;text-align:left;">Name</th>
                 <th style="padding:8px;text-align:left;">Notice Date</th>
+                <th style="padding:8px;text-align:left;">Funeral Home</th>
                 <th style="padding:8px;text-align:left;">Livestream</th>
             </tr>
             {rows}
@@ -342,21 +364,22 @@ def main():
     findings = []
     for notice in new_notices:
         print(f"  Checking: {notice['name']} — {notice['url']}")
-        streams, has_mention, notice_date = check_notice_for_livestream(notice["url"])
+        streams, has_mention, notice_date, funeral_home = check_notice_for_livestream(notice["url"])
         had_stream = bool(streams or has_mention)
 
         primary_streamer = identify_streamer(streams[0]) if streams else None
 
         if had_stream:
             findings.append({
-                "name":        notice["name"],
-                "notice_url":  notice["url"],
-                "streams":     streams,
-                "notice_date": notice_date,
+                "name":         notice["name"],
+                "notice_url":   notice["url"],
+                "streams":      streams,
+                "notice_date":  notice_date,
+                "funeral_home": funeral_home,
             })
-            print(f"    -> Livestream found! {streams} | date: {notice_date}")
+            print(f"    -> Livestream found! {streams} | date: {notice_date} | home: {funeral_home}")
         else:
-            print(f"    -> No livestream | date: {notice_date}")
+            print(f"    -> No livestream | date: {notice_date} | home: {funeral_home}")
 
         mark_processed(
             conn,
@@ -365,6 +388,7 @@ def main():
             had_stream,
             notice_date,
             primary_streamer,
+            funeral_home,
         )
 
     send_summary_email(findings)
