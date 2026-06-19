@@ -28,16 +28,19 @@ HEADERS = {
 }
 
 KNOWN_STREAMERS = {
-    "eventlive":      "EventLive",
-    "churchservices": "Church Services TV",
-    "navanparish":    "Navan Parish",
-    "youtube":        "YouTube",
-    "facebook":       "Facebook Live",
-    "mcnmedia":       "MCN Media",
-    "funeralvideo":   "Funeral Video IE",
-    "vimeo":          "Vimeo",
-    "obitus":         "Obitus",
-    "tributestream":  "Tribute Stream",
+    "eventlive":         "EventLive",
+    "churchservices":    "Church Services TV",
+    "navanparish":       "Navan Parish",
+    "churchmedia":       "Church Media TV",
+    "moxleyproductions": "VidFuneral (Moxley Productions)",
+    "joefinneganmedia":  "Joe Finnegan Media",
+    "youtube":           "YouTube",
+    "facebook":          "Facebook Live",
+    "mcnmedia":          "MCN Media",
+    "funeralvideo":      "Funeral Video IE",
+    "vimeo":             "Vimeo",
+    "obitus":            "Obitus",
+    "tributestream":     "Tribute Stream",
 }
 
 IGNORE_URLS = [
@@ -164,6 +167,8 @@ def check_notice_for_livestream(notice_url):
             is_stream = (
                 "livestream" in text
                 or "live stream" in text
+                or "viewed live" in text
+                or "viewed live" in context
                 or ("live" in text and "stream" in context)
                 or ("click here" in text and "stream" in context)
                 or ("watch" in text and "live" in context)
@@ -175,7 +180,11 @@ def check_notice_for_livestream(notice_url):
                     livestream_links.append(href)
 
         page_text = soup.get_text().lower()
-        has_mention = "livestream" in page_text or "live stream" in page_text
+        has_mention = (
+            "livestream" in page_text
+            or "live stream" in page_text
+            or "viewed live" in page_text
+        )
 
         return livestream_links, has_mention, notice_date
 
