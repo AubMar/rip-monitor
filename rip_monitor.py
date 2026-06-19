@@ -2,6 +2,7 @@ import imaplib
 import smtplib
 import email
 import os
+import re
 import sqlite3
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -43,12 +44,22 @@ IGNORE_URLS = [
     "youtube.com/rip.ie",
 ]
 
+MONTHS = (
+    "January|February|March|April|May|June|July|August|"
+    "September|October|November|December"
+)
+DATE_PATTERN = re.compile(
+    r"\b\d{1,2}(?:st|nd|rd|th)?\s+(?:" + MONTHS + r")\s+\d{4}\b",
+    re.IGNORECASE
+)
+
 
 # ------------------------------------------------------------
 # DATABASE
 # ------------------------------------------------------------
 def init_db():
-    """Create the database table if it doesn't already exist."""
+    """Create the database table if it doesn't already exist, and add
+    any new columns to older databases without losing existing data."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS processed_notices (
@@ -59,11 +70,19 @@ def init_db():
         )
     """)
     conn.commit()
+
+    # Add new columns if upgrading from an older version of the database
+    existing_cols = [row[1] for row in conn.execute("PRAGMA table_info(processed_notices)")]
+    if "notice_date" not in existing_cols:
+        conn.execute("ALTER TABLE processed_notices ADD COLUMN notice_date TEXT")
+    if "streamer" not in existing_cols:
+        conn.execute("ALTER TABLE processed_notices ADD COLUMN streamer TEXT")
+    conn.commit()
+
     return conn
 
 
 def already_processed(conn, notice_url):
-    """Return True if this notice_url already exists in the database."""
     cursor = conn.execute(
         "SELECT 1 FROM processed_notices WHERE notice_url = ?",
         (notice_url,)
@@ -71,12 +90,19 @@ def already_processed(conn, notice_url):
     return cursor.fetchone() is not None
 
 
-def mark_processed(conn, notice_url, name, had_stream):
-    """Insert a record so this notice is never reprocessed."""
+def mark_processed(conn, notice_url, name, had_stream, notice_date, streamer):
     conn.execute(
-        "INSERT OR IGNORE INTO processed_notices (notice_url, name, date_found, had_stream) "
-        "VALUES (?, ?, ?, ?)",
-        (notice_url, name, datetime.now().strftime("%Y-%m-%d %H:%M"), int(had_stream))
+        "INSERT OR IGNORE INTO processed_notices "
+        "(notice_url, name, date_found, had_stream, notice_date, streamer) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            notice_url,
+            name,
+            datetime.now().strftime("%Y-%m-%d %H:%M"),
+            int(had_stream),
+            notice_date,
+            streamer,
+        )
     )
     conn.commit()
 
@@ -104,10 +130,25 @@ def is_ignored_url(url):
     return any(pattern in url for pattern in IGNORE_URLS)
 
 
+def extract_notice_date(soup):
+    """Try to find the death/notice date printed on the rip.ie page itself."""
+    page_text = soup.get_text(" ", strip=True)
+    match = DATE_PATTERN.search(page_text)
+    if match:
+        return match.group(0)
+    return None
+
+
 def check_notice_for_livestream(notice_url):
+    """
+    Visits a rip.ie death notice page.
+    Returns: (livestream_links, has_mention, notice_date)
+    """
     try:
         r = requests.get(notice_url, headers=HEADERS, timeout=15)
         soup = BeautifulSoup(r.text, "html.parser")
+
+        notice_date = extract_notice_date(soup)
 
         links = soup.find_all("a", href=True)
         livestream_links = []
@@ -135,10 +176,10 @@ def check_notice_for_livestream(notice_url):
         page_text = soup.get_text().lower()
         has_mention = "livestream" in page_text or "live stream" in page_text
 
-        return livestream_links, has_mention
+        return livestream_links, has_mention, notice_date
 
     except Exception:
-        return [], False
+        return [], False, None
 
 
 # ------------------------------------------------------------
@@ -177,12 +218,11 @@ def fetch_rip_emails():
     """
     mail = imaplib.IMAP4_SSL("imap.gmail.com")
     mail.login(GMAIL_ADDRESS, APP_PASSWORD)
-    mail.select("inbox", readonly=True)  # readonly=True guarantees nothing gets altered
+    mail.select("inbox", readonly=True)
 
     status, messages = mail.search(None, '(FROM "rip.ie")')
     email_ids = messages[0].split()
 
-    # Limit to the most recent 150 to keep things fast
     email_ids = email_ids[-150:]
 
     fetched = []
@@ -191,7 +231,6 @@ def fetch_rip_emails():
         raw = data[0][1]
         msg = email.message_from_bytes(raw)
         fetched.append(msg)
-        # No mail.store() call - nothing is ever marked as read
 
     mail.logout()
     return fetched
@@ -218,10 +257,15 @@ def send_summary_email(findings):
             else:
                 stream_info = "<i>Livestream mentioned but no direct link found</i>"
 
+            notice_date_display = f.get("notice_date") or "unknown date"
+
             rows += f"""
             <tr>
                 <td style="padding:8px;border-bottom:1px solid #eee;">
                     <a href="{f['notice_url']}">{f['name']}</a>
+                </td>
+                <td style="padding:8px;border-bottom:1px solid #eee;">
+                    {notice_date_display}
                 </td>
                 <td style="padding:8px;border-bottom:1px solid #eee;">
                     {stream_info}
@@ -234,6 +278,7 @@ def send_summary_email(findings):
         <table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;">
             <tr style="background:#c8a951;color:white;">
                 <th style="padding:8px;text-align:left;">Name</th>
+                <th style="padding:8px;text-align:left;">Notice Date</th>
                 <th style="padding:8px;text-align:left;">Livestream</th>
             </tr>
             {rows}
@@ -271,7 +316,6 @@ def main():
         notices = get_rip_links_from_email(msg)
         all_notices.extend(notices)
 
-    # De-duplicate notices that appear in multiple emails this run
     seen_this_run = set()
     unique_notices = []
     for n in all_notices:
@@ -281,28 +325,36 @@ def main():
 
     print(f"Found {len(unique_notices)} unique death notice link(s)")
 
-    # Filter out ones already in the database
     new_notices = [n for n in unique_notices if not already_processed(conn, n["url"])]
     print(f"{len(new_notices)} of those are new (not yet in database)")
 
     findings = []
     for notice in new_notices:
         print(f"  Checking: {notice['name']} — {notice['url']}")
-        streams, has_mention = check_notice_for_livestream(notice["url"])
+        streams, has_mention, notice_date = check_notice_for_livestream(notice["url"])
         had_stream = bool(streams or has_mention)
+
+        primary_streamer = identify_streamer(streams[0]) if streams else None
 
         if had_stream:
             findings.append({
-                "name":       notice["name"],
-                "notice_url": notice["url"],
-                "streams":    streams,
+                "name":        notice["name"],
+                "notice_url":  notice["url"],
+                "streams":     streams,
+                "notice_date": notice_date,
             })
-            print(f"    -> Livestream found! {streams}")
+            print(f"    -> Livestream found! {streams} | date: {notice_date}")
         else:
-            print(f"    -> No livestream")
+            print(f"    -> No livestream | date: {notice_date}")
 
-        # Record in the database either way, so it's never checked again
-        mark_processed(conn, notice["url"], notice["name"], had_stream)
+        mark_processed(
+            conn,
+            notice["url"],
+            notice["name"],
+            had_stream,
+            notice_date,
+            primary_streamer,
+        )
 
     send_summary_email(findings)
     conn.close()
