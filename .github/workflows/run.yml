@@ -35,4 +35,5 @@ jobs:
           git config user.email "actions@github.com"
           git add processed_notices.db
           git diff --staged --quiet || git commit -m "Update processed notices database"
-          git push
+          git pull --rebase origin main
+          git push origin HEAD:main
