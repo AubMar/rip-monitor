@@ -251,7 +251,7 @@ def fetch_rip_emails():
     status, messages = mail.search(None, '(FROM "rip.ie")')
     email_ids = messages[0].split()
 
-    email_ids = email_ids[-150:]
+    email_ids = email_ids[-300:]
 
     fetched = []
     for eid in email_ids:
